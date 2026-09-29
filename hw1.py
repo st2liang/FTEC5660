@@ -62,8 +62,62 @@ def build_chain() -> Any:
     Use the vision-capable DeepSeek Flash model named
     ``deepseek-v4-flash-vision-exp``. The API key is loaded from .env.
     """
-    ### YOUR CODE HERE
-    return None
+    import os
+
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_deepseek import ChatDeepSeek
+
+    system_prompt = (
+        "You are a meticulous supermarket-receipt auditor. "
+        "Read the supplied receipt image carefully and report only amounts "
+        "that are visibly printed on that receipt. Do not estimate, infer "
+        "from another receipt, or include explanations outside the requested "
+        "JSON."
+    )
+    human_prompt = """
+Audit the attached supermarket receipt.
+
+Use these definitions exactly:
+- subtotal_after_discounts_before_rounding: the receipt's printed SUBTOTAL
+  after all discounts have been applied but before any ROUNDING line.
+- discount_total: the sum of the absolute values of every discount line,
+  including promotion, coupon, member, app, packaging-damage, percentage-off,
+  and similar discounts. Report it as a positive number. Do not include the
+  ROUNDING line here.
+- paid_amount: the final amount actually paid after ROUNDING. Use the final
+  payment/tender line (for example OCTOPUS, CASH, CARD, or PAYMENT), not the
+  SUBTOTAL.
+- original_total: subtotal_after_discounts_before_rounding + discount_total.
+  Do not add or subtract the ROUNDING amount.
+
+Read every line, including small print, and reconcile the printed values.
+Return only one valid JSON object with exactly these four decimal-string keys:
+paid_amount, subtotal_after_discounts_before_rounding, discount_total,
+original_total. Do not use currency symbols, markdown, comments, or extra keys.
+"""
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_prompt),
+            (
+                "human",
+                [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "{image_url}"},
+                    },
+                    {"type": "text", "text": human_prompt},
+                ],
+            ),
+        ]
+    )
+    llm = ChatDeepSeek(
+        model="deepseek-v4-flash-vision-exp",
+        api_key=os.environ["DEEPSEEK_API_KEY"],
+        temperature=0,
+        max_retries=2,
+    )
+    return prompt | llm
 
 
 def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
@@ -78,9 +132,190 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
     multimodal human messages. LangChain's ``batch`` method is one simple way
     to process independent receipt-extraction prompts in parallel.
     """
-    ### YOUR CODE HERE
-    _ = (chain, images)
-    return {QUERY_1: DUMMY_RESPONSE, QUERY_2: DUMMY_RESPONSE}
+    import os
+
+    verbose = os.environ.get("HW1_DEBUG", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+    def _parse_json_object(text: str) -> dict[str, Any]:
+        """Extract the first JSON object from a model response."""
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        decoder = json.JSONDecoder()
+        for match in re.finditer(r"\{", text):
+            try:
+                parsed, _ = decoder.raw_decode(text[match.start() :])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        raise ValueError("the model response did not contain a JSON object")
+
+    def _as_decimal(value: Any) -> Decimal | None:
+        """Convert a model-supplied number to Decimal without changing it."""
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, Decimal):
+            return value
+        text = str(value).strip()
+        match = re.search(r"-?\d[\d,]*(?:\.\d+)?", text)
+        if match is None:
+            return None
+        try:
+            number = Decimal(match.group(0).replace(",", ""))
+        except InvalidOperation:
+            return None
+        if text.startswith("(") and text.endswith(")"):
+            number = -abs(number)
+        return number
+
+    def _normalise_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            str(key).strip().lower().replace(" ", "_").replace("-", "_"): value
+            for key, value in payload.items()
+        }
+
+    def _find_decimal(
+        payload: dict[str, Any], names: tuple[str, ...]
+    ) -> Decimal | None:
+        for name in names:
+            if name in payload:
+                number = _as_decimal(payload[name])
+                if number is not None:
+                    return number
+        return None
+
+    def _find_decimal_in_text(text: str, names: tuple[str, ...]) -> Decimal | None:
+        for name in names:
+            pattern = (
+                r"(?i)[\"']?"
+                + re.escape(name)
+                + r"[\"']?\s*[:=]\s*[^\d\-]*"
+                + r"(-?\d[\d,]*(?:\.\d+)?)"
+            )
+            match = re.search(pattern, text)
+            if match is None:
+                continue
+            number = _as_decimal(match.group(1))
+            if number is not None:
+                return number
+        return None
+
+    paid_names = (
+        "paid_amount",
+        "amount_paid",
+        "amount_paid_after_rounding",
+        "final_payment",
+        "final_amount",
+        "payment_amount",
+        "total_paid",
+    )
+    subtotal_names = (
+        "subtotal_after_discounts_before_rounding",
+        "subtotal_after_discounts",
+        "subtotal_before_rounding",
+        "subtotal",
+    )
+    discount_names = (
+        "discount_total",
+        "total_discount",
+        "discount_amount",
+    )
+    original_names = (
+        "original_total",
+        "amount_without_discounts",
+        "original_amount",
+        "without_discount_total",
+        "total_before_discounts",
+    )
+
+    batch_inputs = [{"image_url": image_data_url(path)} for path in images]
+    responses = chain.batch(batch_inputs)
+    if len(responses) != len(images):
+        raise ValueError("the chain returned a different number of responses")
+
+    total_spent = Decimal("0.00")
+    total_original = Decimal("0.00")
+
+    for image, response in zip(images, responses):
+        text = response_text(response)
+        try:
+            payload = _normalise_payload(_parse_json_object(text))
+        except ValueError:
+            payload = {}
+
+        paid = _find_decimal(payload, paid_names)
+        subtotal = _find_decimal(payload, subtotal_names)
+        discount = _find_decimal(payload, discount_names)
+        original = _find_decimal(payload, original_names)
+
+        if paid is None:
+            paid = _find_decimal_in_text(text, paid_names)
+        if subtotal is None:
+            subtotal = _find_decimal_in_text(text, subtotal_names)
+        if discount is None:
+            discount = _find_decimal_in_text(text, discount_names)
+        if original is None:
+            original = _find_decimal_in_text(text, original_names)
+
+        if discount is not None:
+            discount = abs(discount)
+
+        model_original = original
+        computed_original: Decimal | None = None
+
+        # The assignment defines the second answer as SUBTOTAL plus every
+        # discount. Recomputing it here also catches arithmetic mistakes made
+        # by the model when it fills the original_total field.
+        if subtotal is not None:
+            computed_original = subtotal + (discount or Decimal("0.00"))
+            if original is None or discount is not None:
+                original = computed_original
+
+        if paid is None or original is None:
+            raise ValueError(
+                f"could not extract both required amounts from {image.name}"
+            )
+
+        if verbose:
+            print(f"\n[{image.name}] raw model response:")
+            print(text)
+            print(
+                f"[{image.name}] parsed: "
+                f"paid={paid}, subtotal={subtotal}, discount={discount}, "
+                f"model_original={model_original}, "
+                f"computed_original={computed_original}, "
+                f"used_original={original}"
+            )
+
+        total_spent += paid
+        total_original += original
+
+        if verbose:
+            print(
+                f"[{image.name}] running totals: "
+                f"paid={total_spent:.2f}, original={total_original:.2f}"
+            )
+
+    if verbose:
+        print(
+            "\nFinal totals: "
+            f"paid=HK${total_spent:.2f}, original=HK${total_original:.2f}"
+        )
+
+    return {
+        QUERY_1: f"HK${total_spent:.2f}",
+        QUERY_2: f"HK${total_original:.2f}",
+    }
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
